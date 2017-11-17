@@ -1,15 +1,15 @@
 require 'dragonfly'
-require 'dropbox_sdk'
+require 'dropbox_api'
 require 'dragonfly/dropbox_data_store/version'
 require 'dragonfly/dropbox_data_store/railtie' if defined?(Rails)
-
+require 'open-uri'
 Dragonfly::App.register_datastore(:dropbox) { Dragonfly::DropboxDataStore }
 
 module Dragonfly
   class DropboxDataStore
-    attr_accessor :app_key, :app_secret, :access_token, :access_token_secret, 
+    attr_accessor :app_key, :app_secret, :access_token, :access_token_secret,
                   :user_id, :access_type, :store_meta, :root_path
-    
+
     def initialize(opts = {})
       @app_key             = opts[:app_key]
       @app_secret          = opts[:app_secret]
@@ -30,30 +30,35 @@ module Dragonfly
       # TODO: deal with dropbox vs. app_folder stuff
       # figure out how paths work for each
       path = opts[:path] || absolute(relative_path_for(content.name || 'file'))
-      data_path = storage.put_file(path, content.file)['path']
-      storage.put_file(meta_path(data_path), YAML.dump(content.meta)) if store_meta?
+      data_path = storage.upload(path, content.file)['path']
+      storage.upload(meta_path(data_path), YAML.dump(content.meta)) if store_meta?
       relative(data_path)
     end
 
     def read(path)
       path = absolute(path)
-      # TODO: possibly return some of dropbox's native metadata automatically
-      wrap_error do
-        [ storage.get_file(path),
-          store_meta? && YAML.load(storage.get_file(meta_path(path))) ]
+      path_to_name = "public/images/"+path.gsub('/',"")
+      if File.file?(path_to_name)
+        [open(path_to_name),{name: path_to_name}]
+      else
+        link = storage.get_temporary_link(path).link
+        [open(path_to_name, 'wb') do |file|
+          file << open(link).read
+        end,{name: path_to_name}]
       end
     end
 
     def destroy(path)
       path = absolute(path)
       # TODO: purge empty directories
-      wrap_error { storage.file_delete(meta_path(path)) } if store_meta?
-      wrap_error { storage.file_delete(path) }
+      wrap_error { storage.delete(meta_path(path)) } if store_meta?
+      wrap_error { storage.delete(path) }
     end
 
     # Only option is "expires" and it's a boolean
     def url_for(path, opts = {})
       path = absolute(path)
+      puts "url_for: #{path}"
       (opts[:expires] ? storage.media(path) : storage.shares(path))['url']
     end
 
@@ -65,9 +70,7 @@ module Dragonfly
 
     def storage
       @storage ||= begin
-        session = DropboxSession.new(app_key, app_secret)
-        session.set_access_token(access_token, access_token_secret)
-        DropboxClient.new(session, access_type)
+        DropboxApi::Client.new(access_token)
       end
     end
 
@@ -75,12 +78,13 @@ module Dragonfly
 
     def wrap_error
       yield
-    rescue DropboxError
+    rescue
       nil
     end
 
     def absolute(relative_path)
-      relative_path.to_s == '.' ? root_path : File.join(root_path, relative_path)
+      path = relative_path.to_s == '.' ? root_path : File.join(root_path, relative_path)
+      return "/" + path
     end
 
     def relative(absolute_path)
